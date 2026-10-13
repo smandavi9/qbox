@@ -10,6 +10,7 @@
 #include <cci_configuration>
 
 #include <cstdio>
+#include <atomic>
 #include <vector>
 
 #include <ports/multiinitiator-signal-socket.h>
@@ -39,38 +40,11 @@ class CpuArmCortexA53SimpleResetBase : public CpuArmTestBench<cpu_arm_cortexA53,
 public:
     static constexpr int NUM_WRITES = 1000;
 
-    static constexpr const char* FIRMWARE = R"(
-        _start:
-            ldr x1, =0x%08)" PRIx64 R"(
-
-            mrs x0, mpidr_el1
-
-            and x2, x0, #0xff
-            and x0, x0, #0xff00
-            lsr x0, x0, #5
-            orr  x0, x0, x2
-
-            lsl x0, x0, #3
-            add x1, x1, x0
-            ldr x0, [x1]
-            str x1, [x1]
-        loop:
-            cmp x0, #%d
-            b.ge end
-
-            str x0, [x1]
-            add x0, x0, #1
-            b loop
-
-        end:
-            wfi
-            b end
-    )";
-
 protected:
     std::vector<int> m_writes;
     MultiInitiatorSignalSocket<bool> reset;
-    int finished = 0;
+    MultiInitiatorSignalSocket<bool> m_cpu_halts;
+    std::atomic<int> finished{ 0 };
     int resets = 0;
     int this_resets = 0;
     int reset_threshold = 0;
@@ -89,27 +63,27 @@ protected:
 public:
     CpuArmCortexA53SimpleResetBase(const sc_core::sc_module_name& n)
         : CpuArmTestBench<cpu_arm_cortexA53, CpuTesterMmio>(n)
+        , m_cpu_halts("cpu_halt")
 #ifdef SYSTEMMODE
         , reset_controller_a("reset_a", m_inst_a)
         , reset_controller_b("reset_b", m_inst_b)
 #endif
     {
-        char buf[1024];
-
         for (int i = 0; i < m_cpus.size(); i++) {
             auto& cpu = m_cpus[i];
             cpu.p_start_powered_off = false;
 #ifndef SYSTEMMODE
             reset.bind(cpu.reset);
 #endif
+            m_cpu_halts.bind(cpu.halt);
         }
 #ifdef SYSTEMMODE
         reset.bind(reset_controller_a.reset_in);
         reset.bind(reset_controller_b.reset_in);
 #endif
 
-        std::snprintf(buf, sizeof(buf), FIRMWARE, CpuTesterMmio::MMIO_ADDR, NUM_WRITES);
-        set_firmware(buf);
+        load_firmware_binary(FIRMWARE_BIN_PATH, MEM_ADDR,
+                             { static_cast<uint64_t>(CpuTesterMmio::MMIO_ADDR), static_cast<uint64_t>(NUM_WRITES) });
 
         m_writes.resize(p_num_cpu);
         m_cpu_acked.resize(p_num_cpu, 0);
@@ -242,7 +216,7 @@ public:
 
         reset_ev.async_detach_suspending();
         SCP_INFO(SCMOD) << "Done !";
-        sc_stop();
+        m_cpu_halts.async_write_vector({ true });
     }
 
     virtual void end_of_simulation() override

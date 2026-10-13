@@ -4,9 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
  */
 
-#include <cstdio>
-#include <vector>
-#include <deque>
+#include <atomic>
+#include <thread>
 
 #include "async_event.h"
 #include "test/cpu.h"
@@ -35,45 +34,43 @@ class CpuHexagonResetGPIOTest : public CpuTestBench<qemu_cpu_hexagon, CpuTesterM
      */
     static constexpr int TIMEOUT_LIMIT_MS = 20000;
 
+    // Firmware binary is roughly 40 bytes; load spans a small range we need to
+    // invalidate on reset so QEMU re-fetches the updated code.
+    static constexpr uint64_t FIRMWARE_SPAN = 64;
+
     MultiInitiatorSignalSocket<bool> reset;
     reset_gpio reset_controller;
     hexagon_globalreg hex_gregs;
+    hexagon_tlb tlb_a;
+    hexagon_tlb tlb_b;
     std::thread m_thread;
     gs::async_event reset_event;
+    sc_core::sc_event finish_event;
     int reset_count;
-    int reset_done;
+    std::atomic<bool> reset_done;
     int time_elapsed_ms;
 
-    /*
-     * Instructions with .word are ignored or generate an error with Keystone.
-     * Use this to get the hex codes interactively
-     *     hexagon-llvm-mc --filetype=obj - | hexagon-llvm-objdump -d -
-     */
-    static constexpr const char* FIRMWARE = R"(
-_start:
-    r0 = #0x%x
-    r1 = #0x%x
-    p0 = cmp.eq(r1, #0x%x)
-    .word 0x5c00c006  //if (p0) jump reset_done
-reset:
-    memw(r0) = r1
-    .word 0x5800c000 // jump .
-reset_done:
-    memw(r0) = r1
-    .word 0x6440c000 // wait(r0)
-    )";
+    void load_reset_firmware(uint32_t trigger_val)
+    {
+        load_firmware_binary(FIRMWARE_BIN_PATH, MEM_ADDR,
+                             std::initializer_list<uint32_t>{ static_cast<uint32_t>(CpuTesterMmio::MMIO_ADDR),
+                                                              trigger_val, static_cast<uint32_t>(RESET_DONE) });
+    }
 
 public:
     CpuHexagonResetGPIOTest(const sc_core::sc_module_name& n)
         : CpuTestBench<qemu_cpu_hexagon, CpuTesterMmio>(n)
         , reset_controller("reset", &m_inst_a)
         , hex_gregs("hexagon_globalreg", &m_inst_a)
+        , tlb_a("tlb_a", m_inst_a)
+        , tlb_b("tlb_b", m_inst_b)
         , reset_count(0)
-        , reset_done(0)
+        , reset_done(false)
         , time_elapsed_ms(0)
     {
         for (int i = 0; i < m_cpus.size(); i++) {
             auto& cpu = m_cpus[i];
+            cpu.set_hex_tlb(i % 2 ? &tlb_b : &tlb_a);
             cpu.p_hexagon_num_threads = m_cpus.size();
             cpu.p_start_powered_off = (i != 0);
         }
@@ -85,10 +82,11 @@ public:
         sensitive << reset_event;
         dont_initialize();
 
-        char buf[1024] = { 0 };
-        std::snprintf(buf, sizeof(buf), FIRMWARE, static_cast<uint32_t>(CpuTesterMmio::MMIO_ADDR), RESET_TRIGGER,
-                      RESET_DONE);
-        set_firmware(buf, MEM_ADDR);
+        SC_METHOD(finish_method);
+        sensitive << finish_event;
+        dont_initialize();
+
+        load_reset_firmware(RESET_TRIGGER);
     }
 
     void before_end_of_elaboration() override
@@ -108,7 +106,6 @@ public:
 
     virtual void mmio_write(int id, uint64_t addr, uint64_t data, size_t len) override
     {
-        char buf[1024] = { 0 };
         switch (data) {
         case RESET_TRIGGER:
             TEST_ASSERT(reset_count++ == 0);
@@ -116,14 +113,12 @@ public:
              * Load the final firmware image, now the image will write to this address again
              * with a RESET_DONE value and then wait.
              */
-            std::snprintf(buf, sizeof(buf), FIRMWARE, static_cast<uint32_t>(CpuTesterMmio::MMIO_ADDR), RESET_DONE,
-                          RESET_DONE);
-            set_firmware(buf, MEM_ADDR);
+            load_reset_firmware(RESET_DONE);
             /*
              * Invalidate translation blocks for the firmware region so QEMU re-fetches the new code.
              * Without this, QEMU would execute stale cached instructions after reset.
              */
-            m_inst_a.get().tb_invalidate_phys_range(MEM_ADDR, MEM_ADDR + sizeof(buf));
+            m_inst_a.get().tb_invalidate_phys_range(MEM_ADDR, MEM_ADDR + FIRMWARE_SPAN);
             /*
              * Triggers the reset, this is setup via "sensitive << reset_event" above
              */
@@ -134,7 +129,10 @@ public:
              * This confirms that we have been reset with the updated firmware image and ran enough
              * code afterward to get here.  This is the beginning of the end of the test.
              */
-            reset_done = 1;
+            reset_done.store(true, std::memory_order_release);
+            // Return from the QEMU MMIO callback before detaching the
+            // SystemC keepalive event during shutdown.
+            finish_event.notify(sc_core::sc_time(1, sc_core::SC_PS));
             break;
         default:
             TEST_ASSERT(false);
@@ -148,12 +146,7 @@ public:
     {
         while (1) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            if (reset_done) {
-                /*
-                 * The detach here allows the system-c to exit.  If we skip
-                 * this step sc will just hang.
-                 */
-                reset_event.async_detach_suspending();
+            if (reset_done.load(std::memory_order_acquire)) {
                 return;
             }
             TEST_ASSERT(time_elapsed_ms++ < TIMEOUT_LIMIT_MS);
@@ -164,6 +157,7 @@ public:
         TEST_ASSERT(reset_count == 1);
         reset.async_write_vector({ 1, 0 });
     }
+    void finish_method() { reset_event.async_detach_suspending(); }
 
     virtual void start_of_simulation() override
     {

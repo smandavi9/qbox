@@ -19,6 +19,25 @@
 
 #include <dynlib_loader.h>
 #include <scp/report.h>
+#include <cci_configuration>
+
+extern "C" {
+/*
+ * This function sets the CCI parameter. It gets the broker and parameter handle,
+ * then sets the value if the handle is valid, or creates a new parameter if it is not.
+ */
+void global_set_cci_param(char* key, uint64_t val)
+{
+    auto b = cci::cci_get_broker();
+    auto b_key = b.get_param_handle(key);
+
+    if (b_key.is_valid()) {
+        b_key.set_cci_value(cci::cci_value(val));
+    } else {
+        b.set_preset_cci_value(key, cci::cci_value(val));
+    }
+}
+}
 
 #if defined(_WIN32)
 #include <Lmcons.h>
@@ -205,6 +224,9 @@ private:
         handle = LoadLibraryExA(lib_name.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
 #else
         handle = dlopen(lib_name.c_str(), RTLD_NOW);
+        if (handle == nullptr) {
+            m_last_error = "load_library_internal: Library " + lib_name + " is not loaded (" + dlerror() + ").";
+        }
 #endif
         return handle;
     }

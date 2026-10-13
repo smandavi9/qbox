@@ -8,9 +8,12 @@
 
 #include <systemc>
 
-#include <cstdio>
+#include <atomic>
+#include <cstdlib>
+#include <thread>
 #include <vector>
-#include <deque>
+
+#include <libgssync.h>
 
 #include "test/cpu.h"
 #include "test/tester/dmi_soak.h"
@@ -36,70 +39,6 @@ class CpuArmCortexA53DmiAsyncInvalTest : public CpuArmTestBench<cpu_arm_cortexA5
 public:
     static constexpr uint64_t NUM_WRITES = 10000;
 
-    static constexpr const char* FIRMWARE = R"(
-        _start:
-            ldr x2, =0x%08)" PRIx64 R"(
-            ldr x1, =0x%08)" PRIx64 R"(
-            ldr x5, =0x%08)" PRIx64 R"(
-            ldr x6, =0x%08)" PRIx64 R"(
-            ldr x3, =0x%08)" PRIx64 R"(
-
-
-            mrs x0, mpidr_el1
-
-            and x10, x0, #0xff
-            and x0, x0, #0xff00
-            lsr x0, x0, #5
-            orr  x0, x0, x10
-            lsl x0, x0, #3
-
-            add x2, x2, x0
-            ror x6, x6, x0
-
-        loop:
-            mov x0, #1
-            str x0, [x2]
-            str x3, [x2]
-
-            mov x10, x6
-            ror x10, x10, #17
-            eor x6, x6, x10
-            ror x10, x10, #54
-            eor x6, x6, x10
-            ror x10, x10, #29
-            eor x6, x6, x10
-            mov x6, x10
-
-            and x10, x10, x5
-
-            add x10, x10, x1
-            and x10, x10, #-8
-            str x10, [x10]
-
-            mov x0, #2
-            str x0, [x2]
-            str x10, [x2]
-
-            ldr x7, [x10]
-            cmp x10, x7
-            b.ne fail
-
-            sub x3, x3, #1
-            cmp x3, #0
-            b.ne loop
-
-        end:
-            wfi
-            mov x0, #0
-            str x0, [x2]
-            b end
-
-        fail:
-            mov x0, #-2
-            str x0, [x2]
-            b end
-    )";
-
 private:
     /*
      * Decrease the number of write per CPU when the number of CPUs increases
@@ -107,38 +46,45 @@ private:
      */
     uint64_t m_num_write_per_cpu;
     std::thread m_thread;
-    bool running = 0;
+    std::atomic<bool> running{ false };
+    gs::runonsysc m_invalidation_on_sysc;
 
 public:
     CpuArmCortexA53DmiAsyncInvalTest(const sc_core::sc_module_name& n)
-        : CpuArmTestBench<cpu_arm_cortexA53, CpuTesterDmiSoak>(n)
+        : CpuArmTestBench<cpu_arm_cortexA53, CpuTesterDmiSoak>(n), m_invalidation_on_sysc("invalidation_on_sysc")
     {
-        char buf[2048];
         SCP_DEBUG(SCMOD) << "CpuArmCortexA53DmiAsyncInvalTest constructor";
         m_num_write_per_cpu = NUM_WRITES / (p_num_cpu * 2);
 
-        std::snprintf(buf, sizeof(buf), FIRMWARE, CpuTesterDmiSoak::MMIO_ADDR, CpuTesterDmiSoak::DMI_ADDR,
-                      CpuTesterDmiSoak::DMI_SIZE - 1, (((uint64_t)std::rand() << 32) | rand()), m_num_write_per_cpu);
-        set_firmware(buf);
+        uint64_t rng_seed = ((static_cast<uint64_t>(std::rand()) << 32) | std::rand());
+        load_firmware_binary(
+            FIRMWARE_BIN_PATH, MEM_ADDR,
+            { static_cast<uint64_t>(CpuTesterDmiSoak::MMIO_ADDR), static_cast<uint64_t>(CpuTesterDmiSoak::DMI_ADDR),
+              static_cast<uint64_t>(CpuTesterDmiSoak::DMI_SIZE - 1), rng_seed, m_num_write_per_cpu });
     }
 
     virtual void start_of_simulation() override
     {
-        running = true;
+        running.store(true, std::memory_order_release);
         m_thread = std::thread([&]() { inval(); });
     }
     void inval()
     {
-        while (running) {
+        while (running.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             uint64_t l = CpuTesterDmiSoak::DMI_SIZE;
             uint64_t s = (std::rand() + 1u) % l;
             l -= s;
             uint64_t e = s + ((std::rand() + 1u) % l);
-            if (running) {
-                SCP_INFO(SCMOD) << "INVALIDATING";
-                m_tester.dmi_invalidate(s, e);
-                SCP_INFO(SCMOD) << "Invalidation done";
+            if (running.load(std::memory_order_acquire)) {
+                // The timer runs on a native thread. TLM socket callbacks must
+                // run on the SystemC thread to avoid racing CPU transactions.
+                m_invalidation_on_sysc.fork_on_systemc([this, s, e] {
+                    if (!running.load(std::memory_order_acquire)) return;
+                    SCP_INFO(SCMOD) << "INVALIDATING";
+                    m_tester.dmi_invalidate(s, e);
+                    SCP_INFO(SCMOD) << "Invalidation done";
+                });
             }
         }
     }
@@ -187,11 +133,9 @@ public:
     virtual void end_of_simulation() override
     {
         CpuArmTestBench<cpu_arm_cortexA53, CpuTesterDmiSoak>::end_of_simulation();
-        running = false;
+        running.store(false, std::memory_order_release);
         m_thread.join();
     }
 };
-
-constexpr const char* CpuArmCortexA53DmiAsyncInvalTest::FIRMWARE;
 
 int sc_main(int argc, char* argv[]) { return run_testbench<CpuArmCortexA53DmiAsyncInvalTest>(argc, argv); }

@@ -14,6 +14,7 @@
 #include "qemu-instance.h"
 #include "tlm-extensions/qemu-cpu-hint.h"
 #include "tlm-extensions/qemu-mr-hint.h"
+#include "tlm-extensions/qemu-memtx-attrs.h"
 #include <tlm_sockets_buswidth.h>
 
 class TlmTargetToQemuBridge : public tlm::tlm_fw_transport_if<>
@@ -26,6 +27,7 @@ public:
 protected:
     qemu::MemoryRegion m_mr;
     std::shared_ptr<qemu::AddressSpace> m_as;
+    QemuInstance* m_inst = nullptr;
 
     void init_as()
     {
@@ -67,14 +69,16 @@ protected:
     }
 
 public:
-    void init(qemu::SysBusDevice sbd, int mmio_idx)
+    void init(qemu::SysBusDevice sbd, int mmio_idx, QemuInstance& inst)
     {
+        m_inst = &inst;
         m_mr = sbd.mmio_get_region(mmio_idx);
         init_as();
     }
 
-    void init_with_mr(qemu::MemoryRegion mr)
+    void init_with_mr(qemu::MemoryRegion mr, QemuInstance& inst)
     {
+        m_inst = &inst;
         m_mr = mr;
         init_as();
     }
@@ -93,7 +97,34 @@ public:
             return;
         }
 
+        if (const auto* ext = trans.get_extension<gs::QemuMemTxSecureTlmExtension>()) attrs.secure = ext->value;
+        if (const auto* ext = trans.get_extension<gs::QemuMemTxSpaceTlmExtension>()) {
+            attrs.space = static_cast<uint8_t>(ext->value);
+        }
+        if (const auto* ext = trans.get_extension<gs::QemuMemTxUserTlmExtension>()) attrs.user = ext->value;
+        if (const auto* ext = trans.get_extension<gs::QemuMemTxMemoryTlmExtension>()) attrs.memory = ext->value;
+        if (const auto* ext = trans.get_extension<gs::QemuMemTxDebugTlmExtension>()) attrs.debug = ext->value;
+        if (const auto* ext = trans.get_extension<gs::QemuMemTxRequesterIdTlmExtension>()) {
+            attrs.requester_id = ext->value;
+        }
+        if (const auto* ext = trans.get_extension<gs::QemuMemTxPidTlmExtension>()) attrs.pid = ext->value;
+        if (const auto* ext = trans.get_extension<gs::QemuMemTxAddressTypeTlmExtension>()) {
+            attrs.address_type = ext->value;
+        }
+        if (const auto* ext = trans.get_extension<gs::QemuMemTxUnspecifiedTlmExtension>()) {
+            attrs.unspecified = ext->value;
+        }
+
         current_cpu_save = push_current_cpu(trans);
+
+        /*
+         * QEMU device state (ptimer transactions, virtual clock, etc.) is BQL-protected.
+         * SystemC threads reaching this path do not implicitly hold the BQL, so acquire
+         * it for the duration of the QEMU dispatch. The BQL is recursive, so this is
+         * safe even when the caller (e.g. QemuInitiatorSocket reentrancy>1 path) already
+         * holds it.
+         */
+        m_inst->get().lock_iothread();
 
         switch (trans.get_command()) {
         case tlm::TLM_READ_COMMAND:
@@ -106,9 +137,12 @@ public:
 
         default:
             /* TLM_IGNORE_COMMAND already handled above */
+            m_inst->get().unlock_iothread();
             assert(false);
             return;
         }
+
+        m_inst->get().unlock_iothread();
 
         trans.set_extension(new QemuMrHintTlmExtension(m_mr, addr));
 
@@ -174,9 +208,9 @@ public:
         TlmTargetSocket::bind(m_bridge);
     }
 
-    void init(qemu::SysBusDevice sbd, int mmio_idx) { m_bridge.init(sbd, mmio_idx); }
+    void init(qemu::SysBusDevice sbd, int mmio_idx) { m_bridge.init(sbd, mmio_idx, m_inst); }
 
-    void init_with_mr(qemu::MemoryRegion mr) { m_bridge.init_with_mr(mr); }
+    void init_with_mr(qemu::MemoryRegion mr) { m_bridge.init_with_mr(mr, m_inst); }
 };
 
 #endif

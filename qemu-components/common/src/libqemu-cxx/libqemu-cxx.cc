@@ -91,6 +91,8 @@ void LibQemu::init()
     init_callbacks();
 }
 
+const LibQemuExports& LibQemu::plugin_api() const { return m_int->exports(); }
+
 void LibQemu::start_gdb_server(std::string port)
 {
     m_int->exports().gdbserver_start(port.c_str());
@@ -179,6 +181,7 @@ Gpio LibQemu::gpio_new()
 
     Gpio gpio(Object(reinterpret_cast<QemuObject*>(qemu_gpio), m_int));
     gpio.set_proxy(proxy);
+    m_int->retain_gpio_proxy(std::move(proxy));
 
     return gpio;
 }
@@ -193,11 +196,47 @@ Chardev LibQemu::chardev_new(const char* label, const char* type)
     return ret;
 }
 
+Chardev LibQemu::chardev_new(std::string_view label, std::string_view type)
+{
+    std::string l(label);
+    std::string t(type);
+
+    return chardev_new(l.c_str(), t.c_str());
+}
+
+Clock LibQemu::clock_new(QemuObject* o, const char* label)
+{
+    QemuClock* qemu_clock = m_int->exports().clock_new(o, label);
+    Clock ret(Object(reinterpret_cast<QemuObject*>(qemu_clock), m_int));
+
+    return ret;
+}
+
+Clock LibQemu::clock_new(QemuObject* o, std::string_view label)
+{
+    std::string l(label);
+
+    return clock_new(o, l.c_str());
+}
+
+bool LibQemu::clock_set_hz(Clock& clock, uint64_t hz)
+{
+    return m_int->exports().clock_set_hz(reinterpret_cast<QemuClock*>(clock.get_qemu_obj()), hz);
+}
+
+void LibQemu::qdev_connect_clock_in(QemuObject* o, const char* name, Clock& clk)
+{
+    m_int->exports().qdev_connect_clock_in(reinterpret_cast<QemuDevice*>(o), name,
+                                           reinterpret_cast<QemuClock*>(clk.get_qemu_obj()));
+}
+
 void LibQemu::check_cast(Object& o, const char* type) { /* TODO */ }
 
 void LibQemu::lock_iothread() { m_int->exports().qemu_mutex_lock_iothread(); }
 
 void LibQemu::unlock_iothread() { m_int->exports().qemu_mutex_unlock_iothread(); }
+
+bool LibQemu::is_iothread_locked() const { return m_int->exports().qemu_iothread_locked(); }
 
 void LibQemu::rcu_read_lock() { m_int->exports().rcu_read_lock(); }
 

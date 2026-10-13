@@ -9,8 +9,9 @@
 #pragma once
 
 #include <string>
-#include <unordered_map>
+#include <string_view>
 #include <memory>
+#include <limits>
 #include <functional>
 #include <set>
 #include <vector>
@@ -20,6 +21,11 @@
 #include <libqemu-cxx/target_info.h>
 #include <libqemu-cxx/exceptions.h>
 #include <dynlib_loader.h>
+
+/* Brings in the generated LibQemuExports struct and all plugin types
+ * (qemu_plugin_id_t, qemu_plugin_tb, qemu_plugin_cb_flags, callbacks, ...)
+ */
+#include <libqemu/libqemu.h>
 
 #include <scp/report.h>
 
@@ -76,6 +82,7 @@ class Gpio;
 class Timer;
 class Bus;
 class Chardev;
+class Clock;
 class DisplayOptions;
 class DisplayGLCtxOps;
 class Console;
@@ -112,6 +119,9 @@ public:
     LibQemu(LibraryLoaderIface& library_loader, Target t);
     ~LibQemu();
 
+    /* TCG plugin API: returns the libqemu-exports table. */
+    const LibQemuExports& plugin_api() const;
+
     void push_qemu_arg(const char* arg);
     void push_qemu_arg(std::initializer_list<const char*> args);
     const std::vector<char*>& get_qemu_args() const { return m_qemu_argv; }
@@ -127,6 +137,7 @@ public:
 
     void lock_iothread();
     void unlock_iothread();
+    bool is_iothread_locked() const;
 
     RcuReadLock rcu_read_lock_new();
 
@@ -167,6 +178,11 @@ public:
     std::shared_ptr<Timer> timer_new();
 
     Chardev chardev_new(const char* label, const char* type);
+    Chardev chardev_new(std::string_view label, std::string_view type);
+    Clock clock_new(QemuObject* o, const char* label);
+    Clock clock_new(QemuObject* o, std::string_view label);
+    bool clock_set_hz(Clock& clock, uint64_t hz);
+    void qdev_connect_clock_in(QemuObject* o, const char* name, Clock& clk);
 
     void tb_invalidate_phys_range(uint64_t start, uint64_t end);
 
@@ -335,7 +351,14 @@ public:
 
     struct MemTxAttrs {
         bool secure = false;
+        uint8_t space = 0;
+        bool user = false;
+        bool memory = false;
         bool debug = false;
+        uint16_t requester_id = 0;
+        uint8_t pid = 0;
+        bool address_type = false;
+        bool unspecified = false;
 
         MemTxAttrs() = default;
         MemTxAttrs(const ::MemTxAttrs& qemu_attrs);
@@ -455,18 +478,13 @@ class IOMMUMemoryRegion : public MemoryRegion
 public:
     static constexpr const char* const TYPE = "libqemu-iommu-memory-region";
 
-    qemu::MemoryRegion m_root_te;
-    std::shared_ptr<qemu::AddressSpace> m_as_te;
     qemu::MemoryRegion m_root_io;
     std::shared_ptr<qemu::AddressSpace> m_as_io;
-    std::map<uint64_t, std::shared_ptr<DmiRegionBase>> m_dmi_aliases_te;
     std::map<uint64_t, std::shared_ptr<DmiRegionBase>> m_dmi_aliases_io;
     uint64_t min_page_sz;
 
     IOMMUMemoryRegion(const Object& o)
         : MemoryRegion(o)
-        , m_root_te(get_inst().object_new_unparented<qemu::MemoryRegion>())
-        , m_as_te(get_inst().address_space_new())
         , m_root_io(get_inst().object_new_unparented<qemu::MemoryRegion>())
         , m_as_io(get_inst().address_space_new())
     {
@@ -487,12 +505,47 @@ public:
         IOMMUAccessFlags perm;
     };
 
-    std::map<uint64_t, qemu::IOMMUMemoryRegion::IOMMUTLBEntry> m_mapped_te;
+    struct TranslationContext {
+        qemu::MemoryRegion root;
+        std::shared_ptr<qemu::AddressSpace> as;
+        std::map<uint64_t, std::shared_ptr<DmiRegionBase>> dmi_aliases;
+        std::map<uint64_t, IOMMUTLBEntry> mappings;
+
+        explicit TranslationContext(LibQemu& inst)
+            : root(inst.object_new_unparented<qemu::MemoryRegion>())
+            , as(inst.address_space_new())
+        {
+        }
+    };
 
     using IOMMUTranslateCallbackFn = std::function<void(IOMMUTLBEntry*, uint64_t, IOMMUAccessFlags, int)>;
+    using IOMMUAttrsToIndexCallbackFn = std::function<int(MemoryRegionOps::MemTxAttrs)>;
+    using IOMMUNumIndexesCallbackFn = std::function<int()>;
+    using IOMMUIndexToAttrsCallbackFn = std::function<MemoryRegionOps::MemTxAttrs(int)>;
+
     void init(const Object& owner, const char* name, uint64_t size, MemoryRegionOpsPtr ops,
-              IOMMUTranslateCallbackFn cb);
+              IOMMUTranslateCallbackFn cb, IOMMUAttrsToIndexCallbackFn attrs_to_index_cb = {},
+              IOMMUNumIndexesCallbackFn num_indexes_cb = {}, IOMMUIndexToAttrsCallbackFn index_to_attrs_cb = {});
+    MemoryRegionOps::MemTxAttrs attrs_for_index(int idx) const
+    {
+        return m_index_to_attrs_cb ? m_index_to_attrs_cb(idx) : MemoryRegionOps::MemTxAttrs{};
+    }
+    TranslationContext& translation_context(int idx)
+    {
+        auto& context = m_translation_contexts[idx];
+        if (!context) {
+            context = std::make_unique<TranslationContext>(get_inst());
+            context->root.init(*this, "IOMMU translated root", std::numeric_limits<uint64_t>::max());
+            context->as->init(context->root, "IOMMU translated AddressSpace");
+        }
+        return *context;
+    }
+    std::map<int, std::unique_ptr<TranslationContext>>& translation_contexts() { return m_translation_contexts; }
     void iommu_unmap(IOMMUTLBEntry*);
+
+private:
+    IOMMUIndexToAttrsCallbackFn m_index_to_attrs_cb;
+    std::map<int, std::unique_ptr<TranslationContext>> m_translation_contexts;
 };
 
 class MemoryListener
@@ -639,6 +692,8 @@ public:
 
     void set_prop_chardev(const char* name, Chardev chr);
     void set_prop_uint_array(const char* name, std::vector<unsigned int> vec);
+    void set_prop_string(const char* name, const char* value);
+    void set_prop_string(std::string_view name, std::string_view value);
 };
 
 class SysBusDevice : public Device
@@ -753,6 +808,16 @@ public:
     Chardev() = default;
     Chardev(const Chardev& o) = default;
     Chardev(const Object& o): Object(o) {}
+};
+
+class Clock : public Object
+{
+public:
+    static constexpr const char* const TYPE = "clock";
+
+    Clock() = default;
+    Clock(const Clock&) = default;
+    Clock(const Object& o): Object(o) {}
 };
 
 }; /* namespace qemu */

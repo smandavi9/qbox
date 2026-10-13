@@ -75,12 +75,17 @@ private:
     LibQemuObjectCallback<Cpu::EndOfLoopCallbackFn> m_cpu_end_of_loop_cbs;
     LibQemuObjectCallback<Cpu::CpuKickCallbackFn> m_cpu_kick_cbs;
     LibQemuObjectCallback<IOMMUMemoryRegion::IOMMUTranslateCallbackFn> m_iommu_translate_cbs;
+    LibQemuObjectCallback<std::function<void(int*, MemoryRegionOps::MemTxAttrs)>> m_iommu_attrs_to_index_cbs;
+    LibQemuObjectCallback<std::function<void(int*)>> m_iommu_num_indexes_cbs;
     LibQemuObjectCallback<CpuRiscv64::MipUpdateCallbackFn> m_riscv_mip_update_cbs;
+    std::vector<std::shared_ptr<Gpio::GpioProxy>> m_gpio_proxies;
 
     std::vector<LibQemuObjectCallbackBase*> m_cbs{
         &m_cpu_end_of_loop_cbs,
         &m_cpu_kick_cbs,
         &m_iommu_translate_cbs,
+        &m_iommu_attrs_to_index_cbs,
+        &m_iommu_num_indexes_cbs,
         &m_riscv_mip_update_cbs,
     };
 
@@ -105,10 +110,22 @@ public:
         return m_iommu_translate_cbs;
     }
 
+    LibQemuObjectCallback<std::function<void(int*, MemoryRegionOps::MemTxAttrs)>>& get_iommu_attrs_to_index_cb()
+    {
+        return m_iommu_attrs_to_index_cbs;
+    }
+
+    LibQemuObjectCallback<std::function<void(int*)>>& get_iommu_num_indexes_cb()
+    {
+        return m_iommu_num_indexes_cbs;
+    }
+
     LibQemuObjectCallback<CpuRiscv64::MipUpdateCallbackFn>& get_cpu_riscv_mip_update_cb()
     {
         return m_riscv_mip_update_cbs;
     }
+
+    void retain_gpio_proxy(std::shared_ptr<Gpio::GpioProxy> proxy) { m_gpio_proxies.push_back(std::move(proxy)); }
 };
 
 } // namespace qemu

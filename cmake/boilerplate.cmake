@@ -51,8 +51,10 @@ macro(install_systemc_dependencies)
     gs_addexpackage(
         NAME SystemCCCI
         GIT_REPOSITORY ${CCI_GIT}
-        GIT_TAG 915c189f6916ab56db773b2da20ebc06fe8f24e9
-        GIT_SHALLOW True
+        # If GIT_SHALLOW is enabled then GIT_TAG works only with branch names
+        # and tags. A commit hash is not allowed.
+        GIT_TAG aff681775057a9a332983b240f27bb4e6aae3887
+        GIT_SHALLOW OFF
         OPTIONS "SYSTEMCCCI_BUILD_TESTS OFF"
     )
 
@@ -60,7 +62,7 @@ macro(install_systemc_dependencies)
         NAME SCP
         GIT_REPOSITORY ${SCP_GIT}
         GIT_TAG 6830c915bb691d9b505b17ac631f1ff305fe9c17
-        GIT_SHALLOW True
+        GIT_SHALLOW OFF
     )
 endmacro()
 
@@ -85,8 +87,7 @@ macro(configure_systemc)
     add_compile_definitions(HAS_CCI)
 
     if(NOT GS_ONLY)
-        list(APPEND TARGET_LIBS SystemC::systemc SystemC::cci-config scp::reporting)
-        set(TARGET_LIBS "${TARGET_LIBS}" CACHE INTERNAL "target_libs")
+        target_link_libraries(qbox-common INTERFACE SystemC::systemc SystemC::cci-config scp::reporting)
     endif()
 endmacro()
 
@@ -111,12 +112,7 @@ macro(gs_create_dymod MODULE_NAME)
   # Avoid to have the "lib" prefix on the name of the library
   set_target_properties(${MODULE_NAME} PROPERTIES PREFIX "")
 
-  if ( TARGET_LIBS )
-    add_dependencies(${MODULE_NAME} ${TARGET_LIBS})
-    target_link_libraries(${MODULE_NAME} PUBLIC
-        ${TARGET_LIBS}
-    )
-  endif()
+  target_link_libraries(${MODULE_NAME} PUBLIC qbox-common)
 
   if (WIN32)
     target_link_libraries(${MODULE_NAME} PRIVATE ws2_32 mswsock)
@@ -133,13 +129,6 @@ macro(gs_create_dymod MODULE_NAME)
                   "${CMAKE_CURRENT_BINARY_DIR}/${MODULE_NAME}_exports.def")
     target_link_options(${MODULE_NAME} PRIVATE -Wl,--export-all-symbols)
   endif()
-
-  foreach(T IN LISTS TARGET_LIBS)
-    target_include_directories(
-      ${MODULE_NAME} PUBLIC
-      $<TARGET_PROPERTY:${T},INTERFACE_INCLUDE_DIRECTORIES>
-    )
-  endforeach()
 
   target_include_directories(
     ${MODULE_NAME} PUBLIC
@@ -173,11 +162,7 @@ macro(gs_create_dymod MODULE_NAME)
 
   install(
     TARGETS ${MODULE_NAME}
-    # we export the ${MODULE_NAME}, like that we can use ${MODULE_NAME} with qqvp.
-    EXPORT qqvpTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-            COMPONENT "${LIBRARY_NAME}_Runtime"
-            NAMELINK_COMPONENT "${LIBRARY_NAME}_Development"
   )
 
 endmacro()
@@ -194,61 +179,20 @@ macro(build_lua)
       if(NOT WIN32)
         target_compile_definitions(lua PRIVATE LUA_USE_POSIX)
       endif()
-      target_include_directories(lua PUBLIC $<BUILD_INTERFACE:${lua_SOURCE_DIR}>)
+      target_include_directories(lua PUBLIC
+          $<BUILD_INTERFACE:${lua_SOURCE_DIR}>
+          $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+      )
       target_compile_definitions(${PROJECT_NAME} INTERFACE HAS_LUA)
       target_link_libraries(${PROJECT_NAME} PUBLIC lua)
-      list(APPEND TARGET_LIBS "lua")
-      install(TARGETS lua EXPORT ${PROJECT_NAME}Targets)
+      target_link_libraries(qbox-common INTERFACE lua)
+      install(TARGETS lua EXPORT qboxTargets LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+      install(FILES ${lua_SOURCE_DIR}/lua.h ${lua_SOURCE_DIR}/luaconf.h
+                    ${lua_SOURCE_DIR}/lualib.h ${lua_SOURCE_DIR}/lauxlib.h
+              DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
   endif()
 endmacro()
 ################################################################################
-
-# ----- configure include paths and EXPORT PROJECT
-macro(gs_export)
-  if (NOT GS_ONLY)
-    set(LIBRARY_NAME ${PROJECT_NAME})
-    if (${ARGC} GREATER 0)
-      set(LIBRARY_NAME ${ARGV0})
-    endif()
-
-    # We are checking if the second parameters is used like that we are backwards compatible because old versions just used one parameter.
-    if(NOT "${ARGV1}" STREQUAL "")
-      set(INCLUDE_REPO ${ARGV1})
-    else()
-      set(INCLUDE_REPO ${PROJECT_SOURCE_DIR}/include)
-    endif()
-
-    message(STATUS "LIBRARY_NAME = ${LIBRARY_NAME}")
-    string(TOLOWER ${LIBRARY_NAME}/version.h VERSION_HEADER_LOCATION)
-    add_library("lib${LIBRARY_NAME}" ALIAS ${LIBRARY_NAME})
-    add_library("GreenSocs::lib${LIBRARY_NAME}" ALIAS ${LIBRARY_NAME})
-    packageproject(
-      NAME
-      "${LIBRARY_NAME}"
-      VERSION
-      ${PROJECT_VERSION}
-      NAMESPACE
-      GreenSocs
-      BINARY_DIR
-      ${PROJECT_BINARY_DIR}
-      INCLUDE_DIR
-      ${INCLUDE_REPO}
-      INCLUDE_DESTINATION
-      ${CMAKE_INSTALL_INCLUDEDIR}
-      VERSION_HEADER
-      "${VERSION_HEADER_LOCATION}"
-      COMPATIBILITY
-      SameMajorVersion)
-    install(
-      TARGETS ${LIBRARY_NAME}
-      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-              COMPONENT "${LIBRARY_NAME}_Runtime"
-              NAMELINK_COMPONENT "${LIBRARY_NAME}_Development"
-    )
-    list(APPEND TARGET_LIBS "GreenSocs::${LIBRARY_NAME}")
-    set(TARGET_LIBS "${TARGET_LIBS}" CACHE INTERNAL "target_libs")
-  endif()
-endmacro()
 
 # by default switch on verbosity
 
@@ -263,7 +207,6 @@ macro(gs_enable_testing)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
           )
         endif()
-        target_link_libraries(${PROJECT_NAME} INTERFACE gtest gmock)
       endif()
       enable_testing()
       cmake_host_system_information(RESULT _nproc QUERY NUMBER_OF_LOGICAL_CORES)

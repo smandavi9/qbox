@@ -39,7 +39,7 @@ else()
 endif()
 
 
-set(CMAKE_CXX_STANDARD 14 CACHE STRING "C++ standard to build all targets.")
+set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to build all targets.")
 set(CMAKE_CXX_STANDARD_REQUIRED ON CACHE BOOL "The with CMAKE_CXX_STANDARD selected C++ standard is a requirement.")
 set(GIT_BRANCH "main" CACHE STRING "Git branch from which to clone all gs repositoies")
 set(PKG_LOCK "package-lock.cmake" CACHE STRING "Package lock which will be used by the user")
@@ -49,6 +49,7 @@ set(CMAKE_FIND_USE_PACKAGE_REGISTRY FALSE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
+set(BUILD_SHARED_LIBS ON CACHE BOOL "Build shared libraries" FORCE)
 
 # Dependencies URLs
 set(LIBQEMU_GIT "https://github.com/qualcomm/qemu.git" CACHE STRING "libqemu  git url")
@@ -89,6 +90,8 @@ file(
 )
 include(${CMAKE_CURRENT_BINARY_DIR}/cmake/CPM.cmake)
 include(${PROJECT_SOURCE_DIR}/cmake/boilerplate.cmake)
+
+add_library(qbox-common INTERFACE)
 
 # Allow using package-lock.cmake files in projects using this boilerplate to
 # pin repos, etc.
@@ -203,33 +206,16 @@ mark_as_advanced(CMAKE_CXX_STANDARD_REQUIRED)
 #This is an exclusive define for the SCP library which allow to switch ON/OFF if we want thread local or not.
 add_compile_definitions(DISABLE_REPORT_THREAD_LOCAL)
 
-find_path(LIBELF_INCLUDE_DIR NAMES "libelf.h" "libelf/libelf.h"
-          HINTS $ENV{LIBELF_HOME}/include /usr/include /usr/local/include
-          REQUIRED)
-
-find_library(LIBELF_LIBRARIES NAMES elf "libelf.a"
-          HINTS $ENV{LIBELF_HOME}/lib /usr/lib /lib /usr/local/lib
-          REQUIRED)
-
-find_library(LIBZ_LIBRARIES NAMES z "libz.a"
-          HINTS $ENV{LIBZ_HOME}/lib /usr/lib /lib
-          REQUIRED)
-
-list(APPEND LIBELF_LIBRARIES ${LIBZ_LIBRARIES})
-list(APPEND LIBELF_INCLUDE_DIR ${LIBELF_INCLUDE_DIR}/libelf)
-
-FIND_PACKAGE_HANDLE_STANDARD_ARGS(LibELF DEFAULT_MSG
-                                  LIBELF_LIBRARIES
-                                  LIBELF_INCLUDE_DIR)
-
-mark_as_advanced(LIBELF_INCLUDE_DIR LIBELF_LIBRARIES)
-
+# System / local packages (must be installed on the host)
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBELF REQUIRED IMPORTED_TARGET libelf)
+pkg_check_modules(LIBZIP REQUIRED IMPORTED_TARGET libzip)
+pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0)
 
+# CPM packages (fetched from source)
 gs_addexpackage("gh:google/googletest#v1.15.2")
 gs_addexpackage("gh:lua/lua#v5.4.2")
-gs_addexpackage("gh:nih-at/libzip#v1.11.3")
-gs_addexpackage("gh:TheLartians/PackageProject.cmake@1.4.1")
 
 find_package(Git QUIET)
 if(Git_FOUND)
@@ -276,10 +262,13 @@ endif()
 
 set(systemc_srcs
     systemc-components/common/src/cciutils.cc
+    systemc-components/common/src/elf_loader.cc
     systemc-components/common/src/luautils.cc
     systemc-components/common/src/uutils.cc
     systemc-components/common/src/memory_services.cc
     systemc-components/common/src/module_factory_container.cc
+    systemc-components/common/src/zip_loader.cc
+    systemc-components/common/src/reg_model_maker.cc
     systemc-components/common/src/libgssync/pre_suspending_sc_support.cc
     systemc-components/common/src/libgssync/qk_factory.cc
     systemc-components/common/src/libgssync/qkmultithread.cc
@@ -303,6 +292,7 @@ if (NOT WITHOUT_QEMU)
             qemu-components/common/src/libqemu-cxx/gpex.cc
             qemu-components/common/src/libqemu-cxx/gpio.cc
             qemu-components/common/src/libqemu-cxx/libqemu-cxx.cc
+            qemu-components/common/src/libqemu-cxx/libqemu-plugin.cc
             qemu-components/common/src/libqemu-cxx/memory.cc
             qemu-components/common/src/libqemu-cxx/object.cc
             qemu-components/common/src/libqemu-cxx/rcu-read-lock.cc
@@ -315,6 +305,7 @@ if (NOT WITHOUT_QEMU)
             qemu-components/common/src/libqemu-cxx/target/microblaze.cc
             qemu-components/common/src/libqemu-cxx/target-info.cc
             qemu-components/common/src/dmi_utils.cc
+            qemu-components/common/src/qemu-instance-order.cc
         )
 endif()
 
@@ -349,16 +340,22 @@ if (NOT WITHOUT_QEMU)
     )
 
     if(TARGET libqemu)
-        list(APPEND TARGET_LIBS "libqemu")
+        target_link_libraries(qbox-common INTERFACE libqemu)
     endif()
 
     target_include_directories(
         ${PROJECT_NAME} PUBLIC
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/qemu-components/common/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_PREFIX}>
+        $<INSTALL_INTERFACE:qemu-components/common/include>
     )
 
-    target_link_libraries(${PROJECT_NAME} PUBLIC libqemu)
+    target_include_directories(
+        ${PROJECT_NAME} BEFORE PUBLIC
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/qemu-components/common/include/glib_shim>
+        $<INSTALL_INTERFACE:qemu-components/common/include/glib_shim>
+    )
+
+    target_link_libraries(${PROJECT_NAME} PUBLIC libqemu::libqemu)
 
     set(LIBQEMU_CXX_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/qemu-components/common/include/libqemu-cxx)
     install(DIRECTORY ${LIBQEMU_CXX_INCLUDE_DIR} TYPE INCLUDE)
@@ -397,36 +394,78 @@ endif (APPLE)
 target_include_directories(
     ${PROJECT_NAME} PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/systemc-components/common/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_PREFIX}>
-    ${LIBELF_INCLUDE_DIR}
-    )
+    $<INSTALL_INTERFACE:systemc-components/common/include>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/systemc-components/gs_memory/include>
+    $<INSTALL_INTERFACE:systemc-components/gs_memory/include>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/systemc-components/router/include>
+    $<INSTALL_INTERFACE:systemc-components/router/include>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/systemc-components/reg_router/include>
+    $<INSTALL_INTERFACE:systemc-components/reg_router/include>
+)
 
 target_link_libraries(${PROJECT_NAME} PUBLIC
-        ${TARGET_LIBS}
-        ${LIBELF_LIBRARIES}
-        Threads::Threads
+        SystemC::systemc
+        SystemC::cci-config
+        scp::reporting
+)
+
+target_link_libraries(${PROJECT_NAME} PRIVATE
         rpc
         ${CROW_DEP}
-        zip
+        PkgConfig::LIBELF
+        Threads::Threads
+        PkgConfig::LIBZIP
+        PkgConfig::GLIB
         ${PYBIND11_EMBED}
         ${CMAKE_DL_LIBS}
 )
 
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/systemc-components" DESTINATION ${CMAKE_INSTALL_PREFIX})
 
-set(QBOX_INCLUDE_DIR "${QEMU_INCLUDE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/systemc-components")
-gs_export(${PROJECT_NAME} ${QBOX_INCLUDE_DIR})
+# --- Package configuration for find_package(qbox) ---
+include(CMakePackageConfigHelpers)
+
+add_library("qbox::${PROJECT_NAME}" ALIAS ${PROJECT_NAME})
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/qboxConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+configure_package_config_file(
+    cmake/qboxConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/qboxConfig.cmake"
+    INSTALL_DESTINATION lib/cmake/qbox-${PROJECT_VERSION}
+)
+
+install(TARGETS ${PROJECT_NAME}
+    EXPORT qboxTargets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            COMPONENT qbox_Runtime
+            NAMELINK_COMPONENT qbox_Development
+)
+
+install(EXPORT qboxTargets
+    NAMESPACE qbox::
+    DESTINATION lib/cmake/qbox-${PROJECT_VERSION}
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/qboxConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/qboxConfigVersion.cmake"
+    DESTINATION lib/cmake/qbox-${PROJECT_VERSION}
+)
 
 if (NOT DEFINED GS_ONLY)
-    install(TARGETS rpc zip)
+    install(TARGETS rpc)
 endif()
 
-list(APPEND TARGET_LIBS ${PROJECT_NAME})
+target_link_libraries(qbox-common INTERFACE ${PROJECT_NAME})
 
 if(NOT WITHOUT_QEMU)
     add_subdirectory(qemu-components)
     add_subdirectory(platforms)
-    add_subdirectory(examples/hello-qbox)
 endif()
 
 add_subdirectory(systemc-components)
@@ -440,4 +479,3 @@ gs_enable_testing()
 if(UNIX AND NOT APPLE)
     target_link_libraries(${PROJECT_NAME} INTERFACE rt)
 endif()
-

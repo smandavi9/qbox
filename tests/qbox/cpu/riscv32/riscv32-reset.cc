@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
  */
 
+#include <atomic>
 #include <cstdio>
 #include <vector>
 #include <deque>
@@ -45,59 +46,14 @@ class CpuRiscv32ResetGPIOTest : public CpuTestBench<cpu_riscv32, CpuTesterMmio>
     std::thread m_thread;
     gs::async_event reset_event;
     int reset_count;
-    int reset_done;
+    std::atomic<bool> reset_done;
     int time_elapsed_ms;
 
-    /*
-     * Load RISC-V 32-bit firmware from binary file compiled with LLVM tools.
-     * The binary contains the constants at the end that need to be patched.
-     */
-    void load_firmware_binary(uint32_t mmio_addr, uint32_t trigger_val, uint32_t done_val)
+    void load_reset_firmware(uint32_t mmio_addr, uint32_t trigger_val, uint32_t done_val)
     {
-        SCP_DEBUG(SCMOD) << "load_firmware_binary called with mmio_addr=0x" << std::hex << mmio_addr
-                         << ", trigger_val=" << std::dec << trigger_val << ", done_val=" << done_val;
-        // Load the compiled firmware binary
-        const char* firmware_path = FIRMWARE_BIN_PATH;
-        std::ifstream file(firmware_path, std::ios::binary | std::ios::ate);
-
-        if (!file.is_open()) {
-            SCP_FATAL(SCMOD) << "Failed to open RISC-V firmware file: " << firmware_path;
-            TEST_ASSERT(false);
-        }
-
-        std::streamsize size = file.tellg();
-        file.seekg(0, std::ios::beg);
-
-        std::vector<uint8_t> firmware_data(size);
-        if (!file.read(reinterpret_cast<char*>(firmware_data.data()), size)) {
-            SCP_FATAL(SCMOD) << "Failed to read RISC-V firmware file: " << firmware_path;
-            TEST_ASSERT(false);
-        }
-
-        // Patch the constants in the binary (last 12 bytes: mmio_addr, trigger_val, done_val)
-        TEST_ASSERT(size >= 12);
-        uint32_t* mmio_addr_ptr = reinterpret_cast<uint32_t*>(firmware_data.data() + size - 12);
-        uint32_t* trigger_val_ptr = reinterpret_cast<uint32_t*>(firmware_data.data() + size - 8);
-        uint32_t* done_val_ptr = reinterpret_cast<uint32_t*>(firmware_data.data() + size - 4);
-
-        *mmio_addr_ptr = mmio_addr;
-        *trigger_val_ptr = trigger_val;
-        *done_val_ptr = done_val;
-
-        // Log firmware being loaded (for verification during testing)
-        if (trigger_val == RESET_TRIGGER) {
-            SCP_INFO(SCMOD) << "Loading initial RISC-V firmware with trigger_val=" << trigger_val << " from "
-                            << firmware_path;
-        } else {
-            SCP_INFO(SCMOD) << "Loading reset firmware with trigger_val=" << trigger_val << " from " << firmware_path;
-        }
-
-        // Load firmware directly into memory without keystone assembly
-        SCP_DEBUG(SCMOD) << "Loading RISC-V firmware at 0x" << std::hex << MEM_ADDR << " (MEM_ADDR), size=" << std::dec
-                         << size << " bytes";
-        m_mem.load.ptr_load(firmware_data.data(), MEM_ADDR, size);
-
-        SCP_DEBUG(SCMOD) << "Firmware loaded successfully";
+        SCP_INFO(SCMOD) << "Loading RISC-V firmware (trigger_val=" << trigger_val << ") from " << FIRMWARE_BIN_PATH;
+        load_firmware_binary(FIRMWARE_BIN_PATH, MEM_ADDR,
+                             std::initializer_list<uint32_t>{ mmio_addr, trigger_val, done_val });
     }
 
 public:
@@ -105,7 +61,7 @@ public:
         : CpuTestBench<cpu_riscv32, CpuTesterMmio>(n)
         , reset_controller("reset", &m_inst_a)
         , reset_count(0)
-        , reset_done(0)
+        , reset_done(false)
         , time_elapsed_ms(0)
     {
         for (int i = 0; i < m_cpus.size(); i++) {
@@ -124,7 +80,7 @@ public:
         dont_initialize();
 
         // Load RISC-V 32-bit binary firmware compiled with LLVM tools
-        load_firmware_binary(static_cast<uint32_t>(CpuTesterMmio::MMIO_ADDR), RESET_TRIGGER, RESET_DONE);
+        load_reset_firmware(static_cast<uint32_t>(CpuTesterMmio::MMIO_ADDR), RESET_TRIGGER, RESET_DONE);
     }
 
     virtual ~CpuRiscv32ResetGPIOTest() {}
@@ -148,9 +104,9 @@ public:
              * Load the final firmware image, now the image will write to this address again
              * with a RESET_DONE value and then wait.
              */
-            SCP_DEBUG(SCMOD) << "About to call load_firmware_binary with RESET_DONE";
-            load_firmware_binary(static_cast<uint32_t>(CpuTesterMmio::MMIO_ADDR), RESET_DONE, RESET_DONE);
-            SCP_DEBUG(SCMOD) << "load_firmware_binary call completed";
+            SCP_DEBUG(SCMOD) << "About to call load_reset_firmware with RESET_DONE";
+            load_reset_firmware(static_cast<uint32_t>(CpuTesterMmio::MMIO_ADDR), RESET_DONE, RESET_DONE);
+            SCP_DEBUG(SCMOD) << "load_reset_firmware call completed";
 
             /*
              * Invalidate TB cache to ensure cached translations of old firmware are cleared
@@ -161,18 +117,23 @@ public:
             SCP_DEBUG(SCMOD) << "TB cache invalidation completed";
 
             /*
-             * Triggers the reset, this is setup via "sensitive << reset_event" above
-             * Use a larger delay to ensure firmware loading and TB flushing complete first
-             * Increased delay for COROUTINE threading mode compatibility
+             * Triggers the reset, this is setup via "sensitive << reset_event" above.
+             * Use a delta notification (SC_ZERO_TIME) so it fires in the next
+             * delta cycle at the current simulation time.  A timed delay (e.g.
+             * 1 SC_US) would require SystemC time to advance, which in mcips
+             * mode only happens when the sync_window moves forward, leaving
+             * the event stranded while the CPU spins in a tight MMIO loop.
+             * Firmware loading and TB invalidation are already complete before
+             * this point, so no additional delay is needed.
              */
-            reset_event.notify(sc_core::sc_time(1, sc_core::SC_US));
+            reset_event.notify(sc_core::SC_ZERO_TIME);
             break;
         case RESET_DONE:
             /*
              * This confirms that we have been reset with the updated firmware image and ran enough
              * code afterward to get here.  This is the beginning of the end of the test.
              */
-            reset_done = 1;
+            reset_done.store(true, std::memory_order_release);
             SCP_INFO(SCMOD) << "Reset test completed successfully, stopping simulation";
             sc_core::sc_stop();
             break;
@@ -188,7 +149,7 @@ public:
     {
         while (1) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            if (reset_done) {
+            if (reset_done.load(std::memory_order_acquire)) {
                 /*
                  * The detach here allows the system-c to exit.  If we skip
                  * this step sc will just hang.
